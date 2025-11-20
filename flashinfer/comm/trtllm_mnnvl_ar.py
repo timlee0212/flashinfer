@@ -17,7 +17,7 @@ from flashinfer.comm.mapping import Mapping
 
 from ..jit import gen_trtllm_mnnvl_comm_module
 from ..utils import register_custom_op
-from .mnnvl import McastGPUBuffer
+from .mnnvl import McastGPUBuffer, CommBackend, MPIBackend
 
 
 def mpi_barrier():
@@ -41,14 +41,18 @@ class MNNVLAllreduceFusionStrategy(Enum):
 
 
 # Empirical result calculated from num_tokens * hidden_dim * tp_size * elem_size
-# TODO(Refactor): Consider moving this to a configuration class or file
 MNNVL_ONE_SHOT_THRESHOLD = 64 * 1024 * 8 * 2
 
 
 class MNNVLAllreduceFusionWorkspace:
     NUM_LAMPORT_BUFFERS = 3
 
-    def __init__(self, mapping: Mapping, buffer_size_in_bytes: Optional[int] = None):
+    def __init__(
+        self,
+        mapping: Mapping,
+        buffer_size_in_bytes: Optional[int] = None,
+        comm_backend: Optional[CommBackend] = None,
+    ):
         """
         Initialize the MNNVL Allreduce Fusion Workspace. COMM_WORLD will be used for creating the workspace and synchronization. The process might hang if the intended communication group in mapping is not COMM_WORLD.
 
@@ -64,7 +68,8 @@ class MNNVLAllreduceFusionWorkspace:
             buffer_size_in_bytes = math.ceil(buffer_size_in_bytes / (8 * (1024**2))) * (
                 8 * (1024**2)
             )
-
+        if comm_backend is None:
+            comm_backend = MPIBackend()
         if buffer_size_in_bytes > (2**32 - 1):
             raise ValueError(
                 f"The buffer size in bytes {buffer_size_in_bytes} is greater than the maximum supported size (UINT32_MAX)."
@@ -83,14 +88,14 @@ class MNNVLAllreduceFusionWorkspace:
             mapping.tp_rank,
             torch.device("cuda", mapping.local_rank),
             mapping.is_multi_node(),
+            comm_backend,
         )
 
         # We use FP32 for sentinel value regardless of the real dtype
         self.mcast_buffer_handle.lamport_initialize(mapping.tp_rank, torch.float32)
         # Wait until the initialization is done
         torch.cuda.synchronize()
-        # FIXME: We are assuming using the COMM_WORLD.
-        mpi_barrier()
+        comm_backend.barrier()
 
         # This is a buffer to maintain the state of this allreduce Op
         # Should have the same lifetime with self._buffer
@@ -391,7 +396,10 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
     "get_allreduce_mnnvl_workspace is deprecated, use MNNVLAllreduceFusionWorkspace class to manage the workspace instead"
 )
 def get_allreduce_mnnvl_workspace(
-    mapping: Mapping, dtype: torch.dtype, buffer_size_in_bytes: Optional[int] = None
+    mapping: Mapping,
+    dtype: torch.dtype,
+    comm_backend_for_handle_transfer: Optional[CommBackend] = None,
+    buffer_size_in_bytes: Optional[int] = None,
 ) -> Tuple[McastGPUBuffer, torch.Tensor, int]:
     """Get workspace buffers needed for multi-node NVLink all-reduce operation.
 
@@ -428,7 +436,9 @@ def get_allreduce_mnnvl_workspace(
     ) * (lcm_hidden_dim * stride)
 
     # Redirect to the new workspace allocation logic. The new kernel needs the new flag buffer layout.
-    workspace = MNNVLAllreduceFusionWorkspace(mapping, buffer_size_in_bytes)
+    workspace = MNNVLAllreduceFusionWorkspace(
+        mapping, buffer_size_in_bytes, comm_backend_for_handle_transfer
+    )
 
     mcast_buffer = workspace.mcast_buffer_handle
     buffer_flags = workspace.buffer_flags
@@ -497,7 +507,7 @@ def trtllm_mnnvl_all_reduce(
     )
     module = get_trtllm_mnnvl_comm_module()
     module.trtllm_mnnvl_allreduce_fusion(
-        input,
+        inp,
         multicast_buffer_ptr,
         buffer_ptrs_dev,
         0,  # Allreduce kernel itself does not use this local pointer; still this could be risky but it is only used for legacy code compatibility.

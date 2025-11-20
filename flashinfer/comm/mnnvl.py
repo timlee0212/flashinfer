@@ -1133,6 +1133,7 @@ class McastGPUBuffer:
         group_rank: int,
         device: torch.device,
         mn_nvlink: bool = True,
+        comm_backend_for_handle_transfer: Optional[CommBackend] = None,
     ):
         """
         Constructor for McastGpuBuffer.
@@ -1143,9 +1144,15 @@ class McastGPUBuffer:
             group_rank: The rank of the local process within the group
             device: The CUDA device for buffer allocation
             mn_nvlink: Flag indicating if multi-node NVLink is used
+            comm_backend_for_handle_transfer: The communicator to use for handle transfer
         """
         self.mcast_device_memory = McastDeviceMemory(
-            buf_size, group_size, group_rank, device.index, mn_nvlink
+            buf_size,
+            group_size,
+            group_rank,
+            device.index,
+            mn_nvlink,
+            comm_backend_for_handle_transfer,
         )
         self.buf_size = buf_size
         self.local_device = device
