@@ -1,4 +1,5 @@
 # Check torch version:
+import traceback
 from typing import Tuple
 
 import pytest
@@ -406,8 +407,6 @@ def run_mnnvl_ar_full(
         rank_failed = True
         failure_message = f"FAILED[rank={rank}]: seq_lens={seq_lens}, fusion={fusion}, dtype={dtype} failed: {e}"
         print(failure_message)
-        import traceback
-
         print(traceback.format_exc())
 
         # Gather failure status from all ranks for logging
