@@ -16,6 +16,12 @@
 import ctypes
 import logging
 import os
+import socket
+import array
+import random
+
+import contextlib
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import platform
@@ -123,12 +129,15 @@ def test_cuda_memory_access(ptr: int, size: int, device_id: int) -> bool:
         return False
 
 
-def alloc_and_copy_to_cuda(host_ptr_array: List[int]) -> Optional[int]:
+def alloc_and_copy_to_cuda(host_ptr_array: List[int]) -> int:
     """
     A helper function that allocates memory on cuda and copies the data from the host to the device.
     """
     if not host_ptr_array:
         return None
+
+    for addr in host_ptr_array:
+        print(f"DEBUG: ptr_array: 0x{addr:x}")
 
     ArrayType = ctypes.c_uint64 * len(host_ptr_array)
     c_array = ArrayType(*host_ptr_array)
@@ -140,7 +149,7 @@ def alloc_and_copy_to_cuda(host_ptr_array: List[int]) -> Optional[int]:
     )
     # c_array should be freed by GC
 
-    return device_ptr
+    return int(device_ptr)
 
 
 class CommBackend(ABC):
@@ -154,6 +163,12 @@ class CommBackend(ABC):
 
     @abstractmethod
     def allgather(self, data: int) -> List[int]: ...
+
+    @abstractmethod
+    def bcast(self, data: Any, root: int) -> Any: ...
+
+    @abstractmethod
+    def barrier(self) -> None: ...
 
     @abstractmethod
     def Split(self, color: int, key: int) -> "CommBackend": ...
@@ -208,6 +223,12 @@ class MPIBackend(CommBackend):
 
     def allgather(self, data: int) -> List[int]:
         return self._mpicomm.allgather(data)
+
+    def bcast(self, data: Any, root: int) -> Any:
+        return self._mpicomm.bcast(data, root)
+
+    def barrier(self):
+        self._mpicomm.Barrier()
 
     def Split(self, color: int, key: int) -> CommBackend:
         self._mpicomm = self._mpicomm.Split(color, key)
@@ -545,6 +566,107 @@ class MnnvlMemory:  # type: ignore[no-redef]
         return support_nvlink_and_all_up
 
 
+# The helper class for passing the FD handle over the socket.
+class IpcSocket:
+    """Unix Domain Socket for IPC file descriptor passing"""
+
+    def __init__(self, rank: int, op_id: int, use_abstract=True):
+        """
+        Initialize IPC socket
+
+        Args:
+            rank: Process rank
+            op_id: Unique operation ID (hash)
+            use_abstract: Use Linux abstract socket namespace
+        """
+        self.rank = rank
+        self.op_id = op_id
+        self.use_abstract = use_abstract
+
+        # Create Unix domain socket (DGRAM for compatibility with C code)
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+
+        # Create unique socket name
+        socket_name = f"/tmp/mcastmem-socket-{rank}-{op_id:x}"
+
+        if use_abstract:
+            # Linux abstract socket: prepend null byte
+            self.socket_path = "\0" + socket_name
+        else:
+            self.socket_path = socket_name
+            # Remove existing socket file if it exists
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(socket_name)
+
+        # Bind socket
+        self.sock.bind(self.socket_path)
+
+    def send_fd(self, fd: int, dest_rank: int, dest_op_id: Optional[int] = None):
+        """
+        Send a file descriptor to another process
+
+        Args:
+            fd: File descriptor to send
+            dest_rank: Destination process rank
+            dest_op_id: Destination operation ID
+        """
+        # Construct destination socket path
+        dest_op_id = dest_op_id or self.op_id
+        dest_socket_name = f"/tmp/mcastmem-socket-{dest_rank}-{dest_op_id:x}"
+
+        if self.use_abstract:
+            dest_path = "\0" + dest_socket_name
+        else:
+            dest_path = dest_socket_name
+
+        # Prepare message with file descriptor
+        # Send dummy byte as data (required)
+        dummy_data = b"\x00"
+
+        # Pack file descriptor in ancillary data (SCM_RIGHTS)
+        fds = array.array("i", [fd])
+        ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds.tobytes())]
+
+        # Send message with file descriptor
+        self.sock.sendmsg([dummy_data], ancillary, 0, dest_path)
+
+    def recv_fd(self):
+        """
+        Receive a file descriptor from another process
+
+        Returns:
+            int: Received file descriptor
+        """
+        # Receive message with ancillary data
+        # Maximum size for ancillary data containing one fd
+        fds = array.array("i")
+        msg, ancdata, flags, addr = self.sock.recvmsg(
+            1,
+            socket.CMSG_SPACE(
+                fds.itemsize
+            ),  # Buffer size for dummy data  # Ancillary data size
+        )
+
+        # Extract file descriptor from ancillary data
+        for cmsg_level, cmsg_type, cmsg_data in ancdata:
+            if cmsg_level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
+                fds = array.array("i")
+                fds.frombytes(
+                    cmsg_data[: len(cmsg_data) - (len(cmsg_data) % fds.itemsize)]
+                )
+                return fds[0]
+
+        raise RuntimeError("No file descriptor received")
+
+    def close(self):
+        """Close the socket"""
+        self.sock.close()
+        if not self.use_abstract and self.socket_path:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.socket_path)
+
+
+# TODO: This class follows similar logic with MnnvlMemory, but the latter use single instance mode to manage the memory allocation.
 class McastDeviceMemory:
     """Python port of McastDeviceMemory from TensorRT-LLM"""
 
@@ -555,6 +677,7 @@ class McastDeviceMemory:
         group_rank: int,
         device_idx: int,
         is_multi_node: bool = True,
+        comm_backend_for_handle_transfer: Optional[CommBackend] = None,
     ):
         cu_device = checkCudaErrors(cuda.cuDeviceGet(device_idx))
 
@@ -581,6 +704,7 @@ class McastDeviceMemory:
         self.buf_size = buf_size
         self.signal_pad_offset = 0
         self.allocation_size = 0
+        self.comm_backend = comm_backend_for_handle_transfer or MPIBackend()
 
         # CUDA memory handles and pointers
         self.mc_ptr = 0  # CUdeviceptr mMcPtr
@@ -592,6 +716,8 @@ class McastDeviceMemory:
         self.uc_handles: List[
             int
         ] = []  # std::vector<CUmemGenericAllocationHandle> mUcHandles
+
+        self._shareable_handle_type = None
 
         # Signal pad constants
         self.SIGNAL_PAD_ALIGNMENT = 16
@@ -630,11 +756,17 @@ class McastDeviceMemory:
                 raise RuntimeError(
                     "[McastDeviceMemory] Device does not support fabric handle."
                 )
-
-            self._alloc_mn_mcast_mem(buf_size)
+            # Use fabric handle for multi-node NVLS
+            self._shareable_handle_type = (
+                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+            )
         else:
-            # For single-node NVLS, would need to implement _alloc_nvls_mcast_mem
-            raise NotImplementedError("Single-node NVLS allocation not implemented yet")
+            self._init_ipc_socket()
+            # Use NVLink handle for single-node NVLS
+            self._shareable_handle_type = (
+                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+            )
+        self._alloc_mn_mcast_mem(buf_size)
 
         # Initialize signal pads
         self.signal_pads = [0] * self.group_size
@@ -753,6 +885,15 @@ class McastDeviceMemory:
         """Get the total number of devices in the group"""
         return self.group_size
 
+    def _init_ipc_socket(self):
+        if self.group_rank == 0:
+            # Gnerate the opId
+            opId = random.randint(0, 2**64 - 1)
+        else:
+            opId = None
+        opId = self.comm_backend.bcast(opId, root=0)
+        self._ipc_socket = IpcSocket(self.group_rank, opId)
+
     def _alloc_mn_mcast_mem(self, buf_size: int):
         """Allocate multi-node multicast memory using MNNVL"""
 
@@ -767,14 +908,9 @@ class McastDeviceMemory:
         except Exception as e:
             print(f"Error checking CUDA context: {e}")
 
-        # Get MPI communicator
-        comm = MpiComm()
-
         # Set up allocation properties
-        handle_type = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-
         allocation_prop = cuda.CUmemAllocationProp()
-        allocation_prop.requestedHandleTypes = handle_type
+        allocation_prop.requestedHandleTypes = self._shareable_handle_type
         allocation_prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
         allocation_prop.location = cuda.CUmemLocation()
         allocation_prop.location.type = (
@@ -801,7 +937,7 @@ class McastDeviceMemory:
         mc_prop = cuda.CUmulticastObjectProp()
         mc_prop.numDevices = self.group_size
         mc_prop.size = self.allocation_size
-        mc_prop.handleTypes = handle_type
+        mc_prop.handleTypes = self._shareable_handle_type
 
         # Get multicast granularity
         mc_granularity = checkCudaErrors(
@@ -822,25 +958,47 @@ class McastDeviceMemory:
         )
 
         # Export local handle to fabric handle
-        my_fabric_handle = checkCudaErrors(
+        local_shareable_uc_handle = checkCudaErrors(
             cuda.cuMemExportToShareableHandle(
                 self.uc_handles[self.group_rank],
-                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
+                self._shareable_handle_type,
                 0,
             )
         )
 
-        # All-gather fabric handles
-        all_fabric_handles = comm.allgather(my_fabric_handle.data)
+        if (
+            self._shareable_handle_type
+            == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        ):
+            # All-gather fabric handles
+            all_shareable_uc_handles = self.comm_backend.allgather(
+                local_shareable_uc_handle.data
+            )
+        else:
+            # Implement the allgather logic with ipc socket
+            # TODO: Do we need to model ipc socket as a comm backend? My tenative answer is no as it is not able to perform bootstrap without other communicator's help.
+            all_shareable_uc_handles = [None] * self.group_size
+            for i in range(self.group_size):
+                self.comm_backend.barrier()
+                # Send to peer at offset i
+                dest_rank = (self.group_rank + i) % self.group_size
+                self._ipc_socket.send_fd(local_shareable_uc_handle, dest_rank)
+                # Receive from peer at offset -i
+                src_rank = (self.group_rank + self.group_size - i) % self.group_size
+                all_shareable_uc_handles[src_rank] = self._ipc_socket.recv_fd()
         cuda.cuCtxSynchronize()
+
+        print(
+            f"[Rank {self.group_rank}] all_shareable_uc_handles: {all_shareable_uc_handles}"
+        )
 
         # Import remote handles
         for p in range(self.group_size):
             if p != self.group_rank:
                 self.uc_handles[p] = checkCudaErrors(
                     cuda.cuMemImportFromShareableHandle(
-                        all_fabric_handles[p],
-                        cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
+                        all_shareable_uc_handles[p],
+                        self._shareable_handle_type,
                     )
                 )
 
@@ -849,29 +1007,46 @@ class McastDeviceMemory:
             # Create multicast object
             self.mc_handle = checkCudaErrors(cuda.cuMulticastCreate(mc_prop))
 
-            # Export multicast handle
-            mc_fabric_handle = checkCudaErrors(
+            # Export multicast handle, there's only one handle for the entire group
+            shareable_mc_handle = checkCudaErrors(
                 cuda.cuMemExportToShareableHandle(
                     self.mc_handle,
-                    cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
+                    self._shareable_handle_type,
                     0,
                 )
             )
         else:
-            mc_fabric_handle = None
-
-        # Broadcast multicast handle
-        mc_fabric_handle_data = comm.bcast(
-            mc_fabric_handle.data if mc_fabric_handle else None, root=0
-        )
+            shareable_mc_handle = None
+        if (
+            self._shareable_handle_type
+            == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        ):
+            # Broadcast multicast handle
+            shareable_mc_handle = self.comm_backend.bcast(
+                shareable_mc_handle.data if shareable_mc_handle else None, root=0
+            )
+        else:
+            # Implement bcast logic with ipc socket
+            if self.group_rank == 0:
+                for p in range(1, self.group_size):
+                    self.comm_backend.barrier()
+                    self._ipc_socket.send_fd(shareable_mc_handle, p)
+            else:
+                # Other ranks receive from rank 0
+                # We need to order the receive to avoid a race condition bug we encountered. If driver fixed this issue, the additional barriers used for ordering can be removed.
+                for _ in range(self.group_rank):
+                    self.comm_backend.barrier()
+                shareable_mc_handle = self._ipc_socket.recv_fd()
+                for _ in range(self.group_size - self.group_rank - 1):
+                    self.comm_backend.barrier()
         # Sync device to ensure broadcast is complete
         cuda.cuCtxSynchronize()
         # Import multicast handle for non-root ranks
         if self.group_rank != 0:
             self.mc_handle = checkCudaErrors(
                 cuda.cuMemImportFromShareableHandle(
-                    mc_fabric_handle_data,
-                    cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
+                    shareable_mc_handle,
+                    self._shareable_handle_type,
                 )
             )
 
