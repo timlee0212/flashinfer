@@ -882,6 +882,14 @@ class McastDeviceMemory:
         """Get the total number of devices in the group"""
         return self.group_size
 
+    def get_allocation_size(self) -> int:
+        """Get the total allocation size (including signal pad)"""
+        return self.allocation_size
+
+    def get_usable_buffer_size(self) -> int:
+        """Get the usable buffer size (excluding signal pad)"""
+        return self.allocation_size - self.SIGNAL_PAD_SIZE
+
     def _init_ipc_socket(self):
         if self.group_rank == 0:
             # Gnerate the opId
@@ -921,7 +929,7 @@ class McastDeviceMemory:
         alloc_granularity = checkCudaErrors(
             cuda.cuMemGetAllocationGranularity(
                 allocation_prop,
-                cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+                cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
             )
         )
 
@@ -1124,8 +1132,8 @@ class McastDeviceMemory:
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
 
-        # Calculate number of elements that fit in allocation_size
-        num_elements = self.allocation_size // dsize
+        # Calculate number of elements that fit in allocation_size; We don't want to include the signal pad.
+        num_elements = (self.allocation_size - self.SIGNAL_PAD_SIZE) // dsize
 
         checkCudaErrors(
             memset_func(int(self.uc_ptrs[self.group_rank]), neg_zero, num_elements)
@@ -1153,7 +1161,7 @@ class McastGPUBuffer:
         Constructor for McastGpuBuffer.
 
         Args:
-            buf_size: The total size of the buffer in bytes
+            buf_size: The requested size of the buffer in bytes. The actual usable size may differ due to alignment requirements.
             group_size: The number of ranks in the communication group
             group_rank: The rank of the local process within the group
             device: The CUDA device for buffer allocation
@@ -1168,7 +1176,8 @@ class McastGPUBuffer:
             mn_nvlink,
             comm_backend_for_handle_transfer,
         )
-        self.buf_size = buf_size
+        # Update buf_size to reflect the actual usable buffer size after allocation
+        self.buf_size = self.mcast_device_memory.get_usable_buffer_size()
         self.local_device = device
 
     def lamport_initialize(self, rank: int, dtype: torch.dtype):
