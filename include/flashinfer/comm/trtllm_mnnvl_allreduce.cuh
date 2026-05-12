@@ -120,7 +120,7 @@ static constexpr __device__ __host__ T negZero() {
 template <typename T>
 static inline __device__ bool isNegZero(T val) {
   if constexpr (std::is_same_v<T, float>) {
-    return *reinterpret_cast<uint32_t const*>(&val) == kNEGZERO_FP32;
+    return __float_as_uint(val) == kNEGZERO_FP32;
   } else if constexpr (std::is_same_v<T, __nv_bfloat16> || std::is_same_v<T, __nv_half>) {
     return Fp16BitCast<T>(val).mInt == kNEGZERO_FP16;
   } else {
